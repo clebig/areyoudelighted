@@ -1,15 +1,25 @@
 import random
+import json
+import os
+import logging
 from datetime import datetime, timedelta
-from flask import Flask, render_template_string
+from flask import Flask, render_template_string, jsonify, request
+from portalocker import Lock, exceptions
 
-# Initialisation de l'application Flask
 app = Flask(__name__)
 
-# --- Variables globales pour conserver l'état de l'application ---
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler("app_delighted.log"),
+	logging.StreamHandler()
+    ]
+)
+STATE_FILE = 'app_state.json'
 current_response = None
 expiration_time = None
 
-# --- Liste des réponses possibles ---
 DELIGHTED_RESPONSES = [
     "Yes, I'm absolutely delighted today!", 
     "Indeed, I am!",
@@ -155,25 +165,66 @@ HTML_TEMPLATE = """
 </body>
 </html>
 """
+def get_current_state():
+    state = {}
+    if not os.path.exists(STATE_FILE):
+        return state
+    try:
+        with Lock(STATE_FILE, 'r', timeout=5) as fh:
+            state = json.load(fh)
+    except (exceptions.LockException, json.JSONDecodeError):
+        pass
+    return state
+
+def save_new_state(new_state):
+    try:
+        with Lock(STATE_FILE, 'w', timeout=10) as fh:
+            json.dump(new_state, fh)
+    except exceptions.LockException:
+        pass
+
+def get_client_ip():
+    if 'X-Forwarded-For' in request.headers:
+        ip = request.headers['X-Forwarded-For'].split(',')[0].strip()
+    else:
+        ip = request.remote_addr
+    return ip
 
 @app.route('/')
 def are_you_delighted():
-    global current_response, expiration_time
-    if expiration_time is None or datetime.now() > expiration_time:
-        current_response = random.choice(DELIGHTED_RESPONSES)
-        random_duration_seconds = random.randint(60, 86400) # 60s à 24h
-        expiration_time = datetime.now() + timedelta(seconds=random_duration_seconds)
-        
-        print(f"--- NOUVELLE RÉPONSE SÉLECTIONNÉE ---")
-        print(f"Réponse: '{current_response}'")
-        print(f"Expire à: {expiration_time.strftime('%Y-%m-%d %H:%M:%S')}")
+    current_state = get_current_state()
+    current_response = current_state.get('response')
+    expiration_time_str = current_state.get('expiration_time')
+    
+    is_expired = True
+    if expiration_time_str:
+        try:
+            expiration_time = datetime.fromisoformat(expiration_time_str)
+            if datetime.now() < expiration_time:
+                is_expired = False
+        except ValueError:
+            pass
+    
+    if is_expired:
+        new_response = random.choice(DELIGHTED_RESPONSES)
+        random_duration_seconds = random.randint(60, 86400) # 60s..24h
+        new_expiration_time = datetime.now() + timedelta(seconds=random_duration_seconds)
 
-    return render_template_string(
-        HTML_TEMPLATE, 
-        message=current_response, 
-        year=datetime.now().year
-    )
+        new_state = {
+            'response': new_response,
+            'expiration_time': new_expiration_time.isoformat()
+        }
+        
+        save_new_state(new_state)
+
+        logging.info(f"New answer chosen :'{new_response}'")
+        logging.info(f"Expires: {new_expiration_time.strftime('%Y-%m-%d %H:%M:%S')}")
+        
+        return render_template_string(HTML_TEMPLATE, message=new_response, year=datetime.now().year)
+
+    else:
+        logging.info(f"'{get_client_ip()}' - Answer was in cache : '{current_response}' - expires: '{expiration_time}'")
+        return render_template_string(HTML_TEMPLATE, message=current_response, year=datetime.now().year)
 
 if __name__ == '__main__':
     app.run(host="0.0.0.0", port=5000, debug=True)
-
